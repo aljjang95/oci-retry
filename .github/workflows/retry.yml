@@ -1,0 +1,98 @@
+name: OCI ARM Instance Retry
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # 5분마다
+  workflow_dispatch: {}     # 수동 실행도 가능
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if already created
+        id: check
+        run: |
+          if [ "${{ vars.INSTANCE_CREATED }}" = "true" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Instance already created. Skipping."
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install OCI CLI
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          pip install oci-cli --quiet
+          oci --version
+
+      - name: Setup OCI Config
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_CONFIG }}" > ~/.oci/config
+          echo "${{ secrets.OCI_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          echo "${{ secrets.SSH_PUB_KEY }}" > ~/.oci/ssh_key.pub
+
+      - name: Try Create Instance
+        if: steps.check.outputs.skip == 'false'
+        id: create
+        run: |
+          RESULT=$(oci compute instance launch \
+            --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
+            --availability-domain "${{ secrets.AD }}" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --image-id "${{ secrets.IMAGE_ID }}" \
+            --subnet-id "${{ secrets.SUBNET_ID }}" \
+            --display-name "btc-trade-main" \
+            --assign-public-ip true \
+            --boot-volume-size-in-gbs 50 \
+            --metadata "{\"ssh_authorized_keys\":\"$(cat ~/.oci/ssh_key.pub)\"}" \
+            2>&1 || true)
+
+          echo "$RESULT"
+
+          if echo "$RESULT" | grep -q '"lifecycle-state"'; then
+            INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+            echo "*** INSTANCE CREATED! ID: $INSTANCE_ID ***"
+            echo "created=true" >> $GITHUB_OUTPUT
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          elif echo "$RESULT" | grep -q "Out of host capacity"; then
+            echo "Out of capacity. Will retry in 5 min."
+            echo "created=false" >> $GITHUB_OUTPUT
+          elif echo "$RESULT" | grep -q "LimitExceeded"; then
+            echo "Limit exceeded — maybe already created?"
+            echo "created=false" >> $GITHUB_OUTPUT
+          else
+            echo "Other error. Will retry."
+            echo "created=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get Instance IP
+        if: steps.create.outputs.created == 'true'
+        run: |
+          sleep 30
+          INSTANCE_ID="${{ steps.create.outputs.instance_id }}"
+
+          VNIC_ID=$(oci compute vnic-attachment list \
+            --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'data[0]."vnic-id"' --raw-output)
+
+          PUBLIC_IP=$(oci network vnic get \
+            --vnic-id "$VNIC_ID" \
+            --query 'data."public-ip"' --raw-output)
+
+          echo "==========================================="
+          echo "  SUCCESS!"
+          echo "  Instance: btc-trade-main"
+          echo "  IP: $PUBLIC_IP"
+          echo "  SSH: ssh -i ~/.ssh/oracle_key ubuntu@$PUBLIC_IP"
+          echo "==========================================="
+
+      - name: Notify on success
+        if: steps.create.outputs.created == 'true'
+        run: |
+          echo "TODO: Set INSTANCE_CREATED=true in repo variables to stop retrying"
+          echo "Go to: https://github.com/aljjang95/oci-retry/settings/variables/actions"
