@@ -10,42 +10,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  create-instances:
+  create-instance:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check progress
+      - name: Find next instance to create
         id: check
         run: |
-          # 각 인스턴스 상태 확인
-          TOTAL=4
-          CREATED=0
+          mkdir -p instances
           REMAINING=""
+          CREATED=0
           for i in 1 2 3 4; do
             if [ -f "instances/btc-trade-${i}.created" ]; then
               ((CREATED++))
             else
-              REMAINING="${REMAINING} btc-trade-${i}"
+              [ -z "$REMAINING" ] && REMAINING="btc-trade-${i}"
             fi
           done
           echo "created=$CREATED" >> $GITHUB_OUTPUT
-          echo "remaining=$REMAINING" >> $GITHUB_OUTPUT
-          echo "Progress: $CREATED/$TOTAL created"
-          if [ $CREATED -ge $TOTAL ]; then
+          echo "target=$REMAINING" >> $GITHUB_OUTPUT
+          echo "Progress: $CREATED/4"
+          if [ -z "$REMAINING" ]; then
             echo "all_done=true" >> $GITHUB_OUTPUT
             echo "All 4 instances created!"
           else
             echo "all_done=false" >> $GITHUB_OUTPUT
-            echo "Remaining:$REMAINING"
+            echo "Next target: $REMAINING"
           fi
 
       - name: Install OCI CLI
         if: steps.check.outputs.all_done == 'false'
-        run: |
-          pip install oci-cli --quiet 2>/dev/null
-          oci --version
+        run: pip install oci-cli --quiet 2>/dev/null
 
       - name: Setup OCI Config
         if: steps.check.outputs.all_done == 'false'
@@ -57,120 +54,93 @@ jobs:
           chmod 600 ~/.oci/oci_api_key.pem
           echo "${{ secrets.SSH_PUB_KEY }}" > ~/.oci/ssh_key.pub
 
-      - name: Create instances (1 OCPU + 6GB each)
+      - name: Try create ${{ steps.check.outputs.target }}
         if: steps.check.outputs.all_done == 'false'
         id: create
         run: |
-          mkdir -p instances
-          NEW_CREATED=0
+          NAME="${{ steps.check.outputs.target }}"
+          echo "=== $NAME (1 OCPU + 6GB) ==="
 
-          for NAME in ${{ steps.check.outputs.remaining }}; do
-            echo ""
-            echo "=== $NAME (1 OCPU + 6GB) ==="
+          RESULT=$(oci compute instance launch \
+            --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
+            --availability-domain "${{ secrets.AD }}" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+            --image-id "${{ secrets.IMAGE_ID }}" \
+            --subnet-id "${{ secrets.SUBNET_ID }}" \
+            --display-name "$NAME" \
+            --assign-public-ip true \
+            --boot-volume-size-in-gbs 50 \
+            --metadata "{\"ssh_authorized_keys\":\"$(cat ~/.oci/ssh_key.pub)\"}" \
+            2>&1 || true)
 
-            # Rate limit 대비 최대 2회 재시도
-            SUCCESS=false
-            for attempt in 1 2; do
-              RESULT=$(oci compute instance launch \
-                --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
-                --availability-domain "${{ secrets.AD }}" \
-                --shape "VM.Standard.A1.Flex" \
-                --shape-config '{"ocpus":1,"memoryInGBs":6}' \
-                --image-id "${{ secrets.IMAGE_ID }}" \
-                --subnet-id "${{ secrets.SUBNET_ID }}" \
-                --display-name "$NAME" \
-                --assign-public-ip true \
-                --boot-volume-size-in-gbs 50 \
-                --metadata "{\"ssh_authorized_keys\":\"$(cat ~/.oci/ssh_key.pub)\"}" \
-                2>&1 || true)
+          if echo "$RESULT" | grep -q '"lifecycle-state"'; then
+            INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+            echo "*** $NAME CREATED! ***"
+            echo "created=true" >> $GITHUB_OUTPUT
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+            echo "name=$NAME" >> $GITHUB_OUTPUT
+          elif echo "$RESULT" | grep -q "Out of host capacity"; then
+            echo "Out of capacity. Will retry next run."
+            echo "created=false" >> $GITHUB_OUTPUT
+          elif echo "$RESULT" | grep -q "LimitExceeded"; then
+            echo "OCPU limit reached (all 4 allocated)."
+            echo "created=false" >> $GITHUB_OUTPUT
+          elif echo "$RESULT" | grep -q "Too many requests"; then
+            echo "Rate limited. Will retry next run."
+            echo "created=false" >> $GITHUB_OUTPUT
+          else
+            echo "Error:"
+            echo "$RESULT" | tail -5
+            echo "created=false" >> $GITHUB_OUTPUT
+          fi
 
-              if echo "$RESULT" | grep -q '"lifecycle-state"'; then
-                INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
-                echo "*** $NAME CREATED! ID: $INSTANCE_ID ***"
-
-                # IP 조회 (최대 60초 대기)
-                sleep 30
-                VNIC_ID=$(oci compute vnic-attachment list \
-                  --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
-                  --instance-id "$INSTANCE_ID" \
-                  --query 'data[0]."vnic-id"' --raw-output 2>/dev/null || echo "")
-                PUBLIC_IP="pending"
-                if [ -n "$VNIC_ID" ] && [ "$VNIC_ID" != "null" ]; then
-                  PUBLIC_IP=$(oci network vnic get \
-                    --vnic-id "$VNIC_ID" \
-                    --query 'data."public-ip"' --raw-output 2>/dev/null || echo "pending")
-                fi
-
-                echo "$NAME $INSTANCE_ID $PUBLIC_IP $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "instances/${NAME}.created"
-                echo "  IP: $PUBLIC_IP"
-                ((NEW_CREATED++))
-                SUCCESS=true
-                break
-
-              elif echo "$RESULT" | grep -q "Out of host capacity"; then
-                echo "  Out of capacity."
-                break
-              elif echo "$RESULT" | grep -q "LimitExceeded"; then
-                echo "  OCPU limit reached (all 4 used)."
-                break 2  # 전체 루프 종료
-              elif echo "$RESULT" | grep -q "Too many requests"; then
-                echo "  Rate limited. Waiting 60s... (attempt $attempt)"
-                sleep 60
-              else
-                MSG=$(echo "$RESULT" | grep -o '"message":"[^"]*"' | head -1)
-                echo "  Error: $MSG"
-                break
-              fi
-            done
-
-            # 성공하면 다음 인스턴스 바로 시도 (여유 5초)
-            if [ "$SUCCESS" = true ]; then
-              sleep 5
-            fi
-          done
-
-          echo ""
-          echo "This run created: $NEW_CREATED instance(s)"
-          echo "new_created=$NEW_CREATED" >> $GITHUB_OUTPUT
-
-      - name: Commit progress
-        if: steps.check.outputs.all_done == 'false'
+      - name: Get IP and save
+        if: steps.create.outputs.created == 'true'
         run: |
+          NAME="${{ steps.create.outputs.name }}"
+          INSTANCE_ID="${{ steps.create.outputs.instance_id }}"
+          echo "Waiting 30s for IP assignment..."
+          sleep 30
+
+          PUBLIC_IP="pending"
+          VNIC_ID=$(oci compute vnic-attachment list \
+            --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'data[0]."vnic-id"' --raw-output 2>/dev/null || echo "")
+          if [ -n "$VNIC_ID" ] && [ "$VNIC_ID" != "null" ]; then
+            PUBLIC_IP=$(oci network vnic get \
+              --vnic-id "$VNIC_ID" \
+              --query 'data."public-ip"' --raw-output 2>/dev/null || echo "pending")
+          fi
+
+          echo "==========================================="
+          echo "  $NAME CREATED!"
+          echo "  IP: $PUBLIC_IP"
+          echo "  ID: $INSTANCE_ID"
+          echo "  SSH: ssh -i ~/.ssh/oracle_key ubuntu@$PUBLIC_IP"
+          echo "==========================================="
+
+          mkdir -p instances
+          echo "$NAME $INSTANCE_ID $PUBLIC_IP $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "instances/${NAME}.created"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add instances/ || true
+          git add instances/
+          TOTAL=$(ls instances/*.created 2>/dev/null | wc -l)
+          git commit -m "instance: $NAME created ($PUBLIC_IP) — ${TOTAL}/4 done"
+          git push
 
-          # 새로 생성된 인스턴스가 있으면 커밋
-          if git diff --cached --quiet 2>/dev/null; then
-            echo "No new instances created this run."
-          else
-            # 현재 진행 상황 카운트
-            TOTAL=$(ls instances/*.created 2>/dev/null | wc -l)
-            git commit -m "instance: ${TOTAL}/4 created"
-            git push
-            echo "Progress committed: ${TOTAL}/4"
-          fi
-
-          # 4대 전부 생성 완료 확인
-          if [ $(ls instances/*.created 2>/dev/null | wc -l) -ge 4 ]; then
-            echo ""
-            echo "==========================================="
-            echo "  ALL 4 INSTANCES CREATED!"
-            echo "==========================================="
-            cat instances/*.created
-          fi
-
-      - name: Keepalive (prevent schedule disable)
-        if: steps.check.outputs.all_done == 'false'
+      - name: Keepalive
+        if: steps.check.outputs.all_done == 'false' && steps.create.outputs.created != 'true'
         run: |
           HOUR=$(date -u +%H)
           MINUTE=$(date -u +%M)
-          # 6시간마다 keepalive 커밋
           if ([ "$HOUR" = "00" ] || [ "$HOUR" = "06" ] || [ "$HOUR" = "12" ] || [ "$HOUR" = "18" ]) && [ "$MINUTE" -lt "10" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > .keepalive
             git add .keepalive
-            git commit -m "keepalive: $(date -u '+%Y-%m-%d %H:%M')" || true
+            git commit -m "keepalive" || true
             git push || true
           fi
