@@ -3,16 +3,23 @@ name: OCI ARM Instance Retry
 on:
   schedule:
     - cron: '*/5 * * * *'  # 5분마다
-  workflow_dispatch: {}     # 수동 실행도 가능
+  workflow_dispatch: {}     # 수동 실행
+
+concurrency:
+  group: oci-retry
+  cancel-in-progress: false
 
 jobs:
   create-instance:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+
       - name: Check if already created
         id: check
         run: |
-          if [ "${{ vars.INSTANCE_CREATED }}" = "true" ]; then
+          if [ -f INSTANCE_CREATED ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
             echo "Instance already created. Skipping."
           else
@@ -22,60 +29,75 @@ jobs:
       - name: Install OCI CLI
         if: steps.check.outputs.skip == 'false'
         run: |
-          pip install oci-cli --quiet
+          pip install oci-cli --quiet 2>/dev/null
           oci --version
 
       - name: Setup OCI Config
         if: steps.check.outputs.skip == 'false'
         run: |
           mkdir -p ~/.oci
-          echo "${{ secrets.OCI_CONFIG }}" > ~/.oci/config
+          cat > ~/.oci/config << 'OCIEOF'
+          ${{ secrets.OCI_CONFIG }}
+          OCIEOF
+          # Fix indentation
+          sed -i 's/^          //' ~/.oci/config
           chmod 600 ~/.oci/config
           echo "${{ secrets.OCI_KEY }}" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
           echo "${{ secrets.SSH_PUB_KEY }}" > ~/.oci/ssh_key.pub
 
-      - name: Try Create Instance
+      - name: Try Create Instance (with retry on rate limit)
         if: steps.check.outputs.skip == 'false'
         id: create
         run: |
-          RESULT=$(oci compute instance launch \
-            --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
-            --availability-domain "${{ secrets.AD }}" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
-            --image-id "${{ secrets.IMAGE_ID }}" \
-            --subnet-id "${{ secrets.SUBNET_ID }}" \
-            --display-name "btc-trade-main" \
-            --assign-public-ip true \
-            --boot-volume-size-in-gbs 50 \
-            --metadata "{\"ssh_authorized_keys\":\"$(cat ~/.oci/ssh_key.pub)\"}" \
-            2>&1 || true)
+          MAX_ATTEMPTS=3
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "--- Attempt $i/$MAX_ATTEMPTS ($(date '+%H:%M:%S')) ---"
 
-          echo "$RESULT"
+            RESULT=$(oci compute instance launch \
+              --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
+              --availability-domain "${{ secrets.AD }}" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --image-id "${{ secrets.IMAGE_ID }}" \
+              --subnet-id "${{ secrets.SUBNET_ID }}" \
+              --display-name "btc-trade-main" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs 50 \
+              --metadata "{\"ssh_authorized_keys\":\"$(cat ~/.oci/ssh_key.pub)\"}" \
+              2>&1 || true)
 
-          if echo "$RESULT" | grep -q '"lifecycle-state"'; then
-            INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
-            echo "*** INSTANCE CREATED! ID: $INSTANCE_ID ***"
-            echo "created=true" >> $GITHUB_OUTPUT
-            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          elif echo "$RESULT" | grep -q "Out of host capacity"; then
-            echo "Out of capacity. Will retry in 5 min."
-            echo "created=false" >> $GITHUB_OUTPUT
-          elif echo "$RESULT" | grep -q "LimitExceeded"; then
-            echo "Limit exceeded — maybe already created?"
-            echo "created=false" >> $GITHUB_OUTPUT
-          elif echo "$RESULT" | grep -q "Too many requests"; then
-            echo "Rate limited. Will retry in 5 min."
-            echo "created=false" >> $GITHUB_OUTPUT
-          else
-            echo "Other error:"
-            echo "$RESULT" | tail -20
-            echo "created=false" >> $GITHUB_OUTPUT
-          fi
+            if echo "$RESULT" | grep -q '"lifecycle-state"'; then
+              INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+              echo "*** INSTANCE CREATED! ID: $INSTANCE_ID ***"
+              echo "created=true" >> $GITHUB_OUTPUT
+              echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+              break
+            elif echo "$RESULT" | grep -q "Out of host capacity"; then
+              echo "Out of capacity."
+              echo "created=false" >> $GITHUB_OUTPUT
+              break
+            elif echo "$RESULT" | grep -q "LimitExceeded"; then
+              echo "Limit exceeded — already at max OCPU."
+              echo "created=limit" >> $GITHUB_OUTPUT
+              break
+            elif echo "$RESULT" | grep -q "Too many requests"; then
+              echo "Rate limited. Waiting 60s..."
+              if [ $i -lt $MAX_ATTEMPTS ]; then
+                sleep 60
+              else
+                echo "created=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "Error: $(echo "$RESULT" | grep -o '"message":"[^"]*"' | head -1)"
+              echo "created=false" >> $GITHUB_OUTPUT
+              break
+            fi
+          done
 
       - name: Get Instance IP
         if: steps.create.outputs.created == 'true'
+        id: ip
         run: |
           sleep 30
           INSTANCE_ID="${{ steps.create.outputs.instance_id }}"
@@ -93,12 +115,37 @@ jobs:
           echo "  SUCCESS!"
           echo "  Instance: btc-trade-main"
           echo "  IP: $PUBLIC_IP"
+          echo "  ID: $INSTANCE_ID"
           echo "  SSH: ssh -i ~/.ssh/oracle_key ubuntu@$PUBLIC_IP"
           echo "==========================================="
+          echo "ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
-      - name: Notify on success
+      - name: Mark as created (stop future runs)
         if: steps.create.outputs.created == 'true'
         run: |
-          echo "TODO: Set INSTANCE_CREATED=true in repo variables to stop retrying"
-          echo "Go to: https://github.com/aljjang95/oci-retry/settings/variables/actions"
-# re-registered: 2026-04-13T10:19:35Z
+          IP="${{ steps.ip.outputs.ip }}"
+          INSTANCE_ID="${{ steps.create.outputs.instance_id }}"
+          echo "btc-trade-main $INSTANCE_ID $IP $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > INSTANCE_CREATED
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add INSTANCE_CREATED
+          git commit -m "Instance created: $IP"
+          git push
+
+      - name: Keepalive (prevent schedule disable)
+        if: steps.check.outputs.skip == 'false' && steps.create.outputs.created != 'true'
+        run: |
+          # GitHub disables cron after 60 days of no commits
+          # Touch a file every ~6 hours to keep alive
+          HOUR=$(date -u +%H)
+          if [ "$HOUR" = "00" ] || [ "$HOUR" = "06" ] || [ "$HOUR" = "12" ] || [ "$HOUR" = "18" ]; then
+            MINUTE=$(date -u +%M)
+            if [ "$MINUTE" -lt "10" ]; then
+              echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > .keepalive
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add .keepalive
+              git commit -m "keepalive: $(date -u '+%Y-%m-%d %H:%M')" || true
+              git push || true
+            fi
+          fi
