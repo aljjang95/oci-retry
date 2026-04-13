@@ -101,3 +101,4 @@ jobs:
         run: |
           echo "TODO: Set INSTANCE_CREATED=true in repo variables to stop retrying"
           echo "Go to: https://github.com/aljjang95/oci-retry/settings/variables/actions"
+# re-registered: 2026-04-13
