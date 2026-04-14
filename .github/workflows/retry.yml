@@ -2,7 +2,7 @@ name: OCI ARM Instance Retry
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 6시간마다 (Job 만료 후 재시작용)
+    - cron: '0 */6 * * *'
   workflow_dispatch: {}
 
 concurrency:
@@ -10,9 +10,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  create-instances:
+  create-instance:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # 약 5시간 50분 (6시간 한도 내)
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -28,38 +28,27 @@ jobs:
           chmod 600 ~/.oci/oci_api_key.pem
           echo "${{ secrets.SSH_PUB_KEY }}" > ~/.oci/ssh_key.pub
 
-      - name: Retry loop (5min intervals, ~5.5 hours)
+      - name: Retry with backoff
         run: |
-          mkdir -p instances
-          MAX_ROUNDS=66  # 66 * 5min = 5.5 hours
+          MAX_ROUNDS=33  # 33 * 10min = 5.5 hours
+          WAIT=600       # 10 min base
+          RATE_EXTRA=600 # +10 min on rate limit
 
           for round in $(seq 1 $MAX_ROUNDS); do
-            # 남은 인스턴스 확인
-            CREATED=0
-            NEXT=""
-            for i in 1 2 3 4; do
-              if [ -f "instances/btc-trade-${i}.created" ]; then
-                ((CREATED++))
-              else
-                [ -z "$NEXT" ] && NEXT="btc-trade-${i}"
-              fi
-            done
+            # Random jitter 0-120 seconds
+            JITTER=$((RANDOM % 120))
+            sleep $JITTER
 
-            if [ $CREATED -ge 4 ]; then
-              echo "=== ALL 4 INSTANCES CREATED ==="
-              break
-            fi
-
-            echo "--- Round $round/$MAX_ROUNDS ($(date '+%H:%M:%S')) | ${CREATED}/4 done | target: $NEXT ---"
+            echo "--- Round $round/$MAX_ROUNDS ($(date '+%H:%M:%S')) jitter=${JITTER}s ---"
 
             RESULT=$(oci compute instance launch \
               --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
               --availability-domain "${{ secrets.AD }}" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
               --image-id "${{ secrets.IMAGE_ID }}" \
               --subnet-id "${{ secrets.SUBNET_ID }}" \
-              --display-name "$NEXT" \
+              --display-name "btc-trade-main" \
               --assign-public-ip true \
               --boot-volume-size-in-gbs 50 \
               --metadata "{\"ssh_authorized_keys\":\"$(cat ~/.oci/ssh_key.pub)\"}" \
@@ -67,55 +56,66 @@ jobs:
 
             if echo "$RESULT" | grep -q '"lifecycle-state"'; then
               INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
-              echo "*** $NEXT CREATED! ***"
+              echo "========================================="
+              echo "  INSTANCE CREATED!"
+              echo "  ID: $INSTANCE_ID"
+              echo "========================================="
 
-              sleep 30
-              PUBLIC_IP="pending"
+              sleep 60
               VNIC_ID=$(oci compute vnic-attachment list \
                 --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
                 --instance-id "$INSTANCE_ID" \
                 --query 'data[0]."vnic-id"' --raw-output 2>/dev/null || echo "")
+              PUBLIC_IP="pending"
               if [ -n "$VNIC_ID" ] && [ "$VNIC_ID" != "null" ]; then
                 PUBLIC_IP=$(oci network vnic get \
                   --vnic-id "$VNIC_ID" \
                   --query 'data."public-ip"' --raw-output 2>/dev/null || echo "pending")
               fi
 
-              echo "$NEXT $INSTANCE_ID $PUBLIC_IP $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "instances/${NEXT}.created"
-              echo "  IP: $PUBLIC_IP"
+              echo "  PUBLIC IP: $PUBLIC_IP"
 
-              # 커밋
+              mkdir -p instances
+              echo "btc-trade-main $INSTANCE_ID $PUBLIC_IP $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > instances/btc-trade-main.created
               git config user.name "github-actions[bot]"
               git config user.email "github-actions[bot]@users.noreply.github.com"
               git add instances/
-              TOTAL=$(ls instances/*.created 2>/dev/null | wc -l)
-              git commit -m "instance: $NEXT ($PUBLIC_IP) — ${TOTAL}/4"
+              git commit -m "instance: btc-trade-main ($PUBLIC_IP)"
               git push
+              exit 0
 
-              sleep 5
-              continue  # 바로 다음 인스턴스 시도
+            elif echo "$RESULT" | grep -q "Too many requests"; then
+              echo "  Rate limited — cooling down extra ${RATE_EXTRA}s"
+              sleep $RATE_EXTRA
 
             elif echo "$RESULT" | grep -q "Out of host capacity"; then
-              echo "  Out of capacity."
+              echo "  Out of capacity — normal retry"
+
             elif echo "$RESULT" | grep -q "LimitExceeded"; then
-              echo "  OCPU limit — all 4 allocated. Done."
-              break
-            elif echo "$RESULT" | grep -q "Too many requests"; then
-              echo "  Rate limited."
+              echo "  OCPU limit reached — check OCI console for existing instances"
+              exit 0
+
             else
-              echo "  Error: $(echo "$RESULT" | grep -o '"message":"[^"]*"' | head -1)"
+              MSG=$(echo "$RESULT" | grep -o '"message":"[^"]*"' | head -1)
+              echo "  Error: $MSG"
             fi
 
-            echo "  Waiting 5 min..."
-            sleep 300
+            echo "  Waiting ${WAIT}s..."
+            sleep $WAIT
           done
 
-          # 최종 결과
-          echo ""
-          echo "==========================================="
-          TOTAL=$(ls instances/*.created 2>/dev/null | wc -l)
-          echo "  RESULT: ${TOTAL}/4 instances created"
-          for f in instances/*.created 2>/dev/null; do
-            [ -f "$f" ] && cat "$f"
-          done
-          echo "==========================================="
+          echo "=== $MAX_ROUNDS rounds done, instance not created ==="
+
+      - name: Keepalive commit
+        if: always()
+        run: |
+          HOUR=$(date -u +%H)
+          MINUTE=$(date -u +%M)
+          if ([ "$HOUR" = "00" ] || [ "$HOUR" = "06" ] || [ "$HOUR" = "12" ] || [ "$HOUR" = "18" ]) && [ "$MINUTE" -lt "30" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > .keepalive
+            git add .keepalive
+            git commit -m "keepalive" || true
+            git push || true
+          fi
