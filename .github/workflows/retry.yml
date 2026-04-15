@@ -13,6 +13,22 @@ jobs:
   create-instance:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    strategy:
+      matrix:
+        instance:
+          - name: btc-trade-1
+            ocpus: 1
+            memory: 6
+          - name: btc-trade-2
+            ocpus: 1
+            memory: 6
+          - name: btc-trade-3
+            ocpus: 1
+            memory: 6
+          - name: btc-trade-4
+            ocpus: 1
+            memory: 6
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
@@ -28,27 +44,34 @@ jobs:
           chmod 600 ~/.oci/oci_api_key.pem
           echo "${{ secrets.SSH_PUB_KEY }}" > ~/.oci/ssh_key.pub
 
-      - name: Retry with backoff
+      - name: Retry ${{ matrix.instance.name }}
         run: |
-          MAX_ROUNDS=33  # 33 * 10min = 5.5 hours
-          WAIT=600       # 10 min base
-          RATE_EXTRA=600 # +10 min on rate limit
+          MAX_ROUNDS=33
+          WAIT=600
+          RATE_EXTRA=600
+          NAME="${{ matrix.instance.name }}"
+          OCPUS="${{ matrix.instance.ocpus }}"
+          MEMORY="${{ matrix.instance.memory }}"
+
+          # Stagger start per instance (0-180s)
+          STAGGER=$(( $(echo "$NAME" | grep -o '[0-9]') * 45 ))
+          echo "Stagger delay: ${STAGGER}s for $NAME"
+          sleep $STAGGER
 
           for round in $(seq 1 $MAX_ROUNDS); do
-            # Random jitter 0-120 seconds
             JITTER=$((RANDOM % 120))
             sleep $JITTER
 
-            echo "--- Round $round/$MAX_ROUNDS ($(date '+%H:%M:%S')) jitter=${JITTER}s ---"
+            echo "--- [$NAME] Round $round/$MAX_ROUNDS ($(date '+%H:%M:%S')) jitter=${JITTER}s ---"
 
             RESULT=$(oci compute instance launch \
               --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
               --availability-domain "${{ secrets.AD }}" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --shape-config "{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY}}" \
               --image-id "${{ secrets.IMAGE_ID }}" \
               --subnet-id "${{ secrets.SUBNET_ID }}" \
-              --display-name "btc-trade-main" \
+              --display-name "$NAME" \
               --assign-public-ip true \
               --boot-volume-size-in-gbs 50 \
               --metadata "{\"ssh_authorized_keys\":\"$(cat ~/.oci/ssh_key.pub)\"}" \
@@ -57,7 +80,7 @@ jobs:
             if echo "$RESULT" | grep -q '"lifecycle-state"'; then
               INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
               echo "========================================="
-              echo "  INSTANCE CREATED!"
+              echo "  INSTANCE CREATED: $NAME"
               echo "  ID: $INSTANCE_ID"
               echo "========================================="
 
@@ -76,11 +99,12 @@ jobs:
               echo "  PUBLIC IP: $PUBLIC_IP"
 
               mkdir -p instances
-              echo "btc-trade-main $INSTANCE_ID $PUBLIC_IP $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > instances/btc-trade-main.created
+              echo "$NAME $INSTANCE_ID $PUBLIC_IP $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "instances/${NAME}.created"
               git config user.name "github-actions[bot]"
               git config user.email "github-actions[bot]@users.noreply.github.com"
+              git pull --rebase || true
               git add instances/
-              git commit -m "instance: btc-trade-main ($PUBLIC_IP)"
+              git commit -m "instance: $NAME ($PUBLIC_IP)"
               git push
               exit 0
 
@@ -92,7 +116,7 @@ jobs:
               echo "  Out of capacity — normal retry"
 
             elif echo "$RESULT" | grep -q "LimitExceeded"; then
-              echo "  OCPU limit reached — check OCI console for existing instances"
+              echo "  OCPU limit reached — all capacity allocated!"
               exit 0
 
             else
@@ -104,7 +128,7 @@ jobs:
             sleep $WAIT
           done
 
-          echo "=== $MAX_ROUNDS rounds done, instance not created ==="
+          echo "=== [$NAME] $MAX_ROUNDS rounds done, not created ==="
 
       - name: Keepalive commit
         if: always()
@@ -114,6 +138,7 @@ jobs:
           if ([ "$HOUR" = "00" ] || [ "$HOUR" = "06" ] || [ "$HOUR" = "12" ] || [ "$HOUR" = "18" ]) && [ "$MINUTE" -lt "30" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
+            git pull --rebase || true
             echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > .keepalive
             git add .keepalive
             git commit -m "keepalive" || true
