@@ -157,14 +157,13 @@ jobs:
             echo "VCN exists: $VCN_ID"
           fi
 
-          # 4. Subnet (regional - no AD param for flexibility)
+          # 4. Subnet — find ANY subnet in this VCN (name-agnostic)
           SUBNET_ID=$(oci network subnet list \
             --compartment-id "$COMPARTMENT" \
             --region "$REGION" \
             --vcn-id "$VCN_ID" \
-            --display-name "btc-subnet" \
             --query 'data[0].id' --raw-output 2>&1)
-          echo "Subnet lookup: $SUBNET_ID"
+          echo "Subnet lookup (any in VCN): $SUBNET_ID"
 
           if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "null" ] || echo "$SUBNET_ID" | grep -qi "error"; then
             echo "Creating regional subnet..."
