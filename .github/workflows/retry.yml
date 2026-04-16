@@ -50,24 +50,27 @@ jobs:
 
       - name: Setup region ${{ matrix.instance.region }}
         id: setup
+        shell: bash
         run: |
+          set +e
           REGION="${{ matrix.instance.region }}"
           COMPARTMENT="${{ secrets.COMPARTMENT_ID }}"
+          echo "=== Setting up $REGION ==="
 
-          # Get AD for this region
+          # 1. AD
           AD=$(oci iam availability-domain list \
             --compartment-id "$COMPARTMENT" \
             --region "$REGION" \
-            --query 'data[0].name' --raw-output 2>/dev/null)
-          echo "AD=$AD"
+            --query 'data[0].name' --raw-output 2>&1)
+          echo "AD: $AD"
 
-          if [ -z "$AD" ] || [ "$AD" = "null" ]; then
-            echo "ERROR: Cannot get AD for $REGION — region may not be subscribed"
+          if [ -z "$AD" ] || [ "$AD" = "null" ] || echo "$AD" | grep -qi "error\|not authorized"; then
+            echo "SKIP: Cannot get AD for $REGION"
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Find Ubuntu 22.04 ARM image
+          # 2. ARM image
           IMAGE_ID=$(oci compute image list \
             --compartment-id "$COMPARTMENT" \
             --region "$REGION" \
@@ -75,95 +78,123 @@ jobs:
             --operating-system-version "22.04" \
             --shape "VM.Standard.A1.Flex" \
             --sort-by TIMECREATED --sort-order DESC \
-            --query 'data[0].id' --raw-output 2>/dev/null)
-          echo "IMAGE_ID=$IMAGE_ID"
+            --query 'data[0].id' --raw-output 2>&1)
+          echo "IMAGE: ${IMAGE_ID:0:40}..."
 
-          if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ]; then
-            echo "ERROR: Cannot find ARM image for $REGION"
+          if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ] || echo "$IMAGE_ID" | grep -qi "error"; then
+            echo "SKIP: Cannot find ARM image"
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Check if VCN exists, create if not
+          # 3. VCN
           VCN_ID=$(oci network vcn list \
             --compartment-id "$COMPARTMENT" \
             --region "$REGION" \
             --display-name "btc-vcn" \
-            --query 'data[0].id' --raw-output 2>/dev/null)
+            --query 'data[0].id' --raw-output 2>&1)
 
-          if [ -z "$VCN_ID" ] || [ "$VCN_ID" = "null" ]; then
-            echo "Creating VCN in $REGION..."
-            VCN_ID=$(oci network vcn create \
+          if [ -z "$VCN_ID" ] || [ "$VCN_ID" = "null" ] || echo "$VCN_ID" | grep -qi "error"; then
+            echo "Creating VCN..."
+            VCN_RESULT=$(oci network vcn create \
               --compartment-id "$COMPARTMENT" \
               --region "$REGION" \
               --display-name "btc-vcn" \
               --cidr-blocks '["10.0.0.0/16"]' \
-              --query 'data.id' --raw-output 2>/dev/null)
+              --wait-for-state AVAILABLE \
+              --wait-interval-seconds 5 \
+              2>&1)
+            RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "FATAL: VCN creation failed (rc=$RC):"
+              echo "$VCN_RESULT" | tail -10
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            VCN_ID=$(echo "$VCN_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])" 2>/dev/null)
             echo "VCN created: $VCN_ID"
 
-            # Create internet gateway
-            IGW_ID=$(oci network internet-gateway create \
+            # Internet gateway
+            IGW_RESULT=$(oci network internet-gateway create \
               --compartment-id "$COMPARTMENT" \
               --region "$REGION" \
               --vcn-id "$VCN_ID" \
               --display-name "btc-igw" \
               --is-enabled true \
-              --query 'data.id' --raw-output 2>/dev/null)
-            echo "IGW created: $IGW_ID"
+              --wait-for-state AVAILABLE \
+              --wait-interval-seconds 5 \
+              2>&1)
+            IGW_ID=$(echo "$IGW_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])" 2>/dev/null)
+            echo "IGW: $IGW_ID"
 
-            # Get default route table
-            RT_ID=$(oci network route-table list \
-              --compartment-id "$COMPARTMENT" \
-              --region "$REGION" \
-              --vcn-id "$VCN_ID" \
-              --query 'data[0].id' --raw-output 2>/dev/null)
+            if [ -n "$IGW_ID" ]; then
+              RT_ID=$(oci network route-table list \
+                --compartment-id "$COMPARTMENT" \
+                --region "$REGION" \
+                --vcn-id "$VCN_ID" \
+                --query 'data[0].id' --raw-output 2>&1)
 
-            # Add default route
-            oci network route-table update \
-              --rt-id "$RT_ID" \
-              --region "$REGION" \
-              --route-rules "[{\"destination\":\"0.0.0.0/0\",\"destinationType\":\"CIDR_BLOCK\",\"networkEntityId\":\"$IGW_ID\"}]" \
-              --force 2>/dev/null
+              oci network route-table update \
+                --rt-id "$RT_ID" \
+                --region "$REGION" \
+                --route-rules "[{\"destination\":\"0.0.0.0/0\",\"destinationType\":\"CIDR_BLOCK\",\"networkEntityId\":\"$IGW_ID\"}]" \
+                --force 2>&1 | tail -1
 
-            # Create security list (allow SSH + all egress)
-            SL_ID=$(oci network security-list list \
-              --compartment-id "$COMPARTMENT" \
-              --region "$REGION" \
-              --vcn-id "$VCN_ID" \
-              --query 'data[0].id' --raw-output 2>/dev/null)
+              SL_ID=$(oci network security-list list \
+                --compartment-id "$COMPARTMENT" \
+                --region "$REGION" \
+                --vcn-id "$VCN_ID" \
+                --query 'data[0].id' --raw-output 2>&1)
 
-            oci network security-list update \
-              --security-list-id "$SL_ID" \
-              --region "$REGION" \
-              --ingress-security-rules '[{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}},{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":3030,"max":3030}}},{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":8090,"max":8090}}},{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":8891,"max":8891}}}]' \
-              --egress-security-rules '[{"destination":"0.0.0.0/0","protocol":"all"}]' \
-              --force 2>/dev/null
+              oci network security-list update \
+                --security-list-id "$SL_ID" \
+                --region "$REGION" \
+                --ingress-security-rules '[{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}},{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":3030,"max":3030}}},{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":8090,"max":8090}}},{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":8891,"max":8891}}}]' \
+                --egress-security-rules '[{"destination":"0.0.0.0/0","protocol":"all"}]' \
+                --force 2>&1 | tail -1
+            fi
+          else
+            echo "VCN exists: $VCN_ID"
           fi
-          echo "VCN_ID=$VCN_ID"
 
-          # Check if subnet exists, create if not
+          # 4. Subnet (regional - no AD param for flexibility)
           SUBNET_ID=$(oci network subnet list \
             --compartment-id "$COMPARTMENT" \
             --region "$REGION" \
             --vcn-id "$VCN_ID" \
             --display-name "btc-subnet" \
-            --query 'data[0].id' --raw-output 2>/dev/null)
+            --query 'data[0].id' --raw-output 2>&1)
+          echo "Subnet lookup: $SUBNET_ID"
 
-          if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "null" ]; then
-            echo "Creating subnet in $REGION..."
-            SUBNET_ID=$(oci network subnet create \
+          if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "null" ] || echo "$SUBNET_ID" | grep -qi "error"; then
+            echo "Creating regional subnet..."
+            SUBNET_RESULT=$(oci network subnet create \
               --compartment-id "$COMPARTMENT" \
               --region "$REGION" \
               --vcn-id "$VCN_ID" \
               --display-name "btc-subnet" \
               --cidr-block "10.0.0.0/24" \
-              --availability-domain "$AD" \
-              --query 'data.id' --raw-output 2>/dev/null)
+              --wait-for-state AVAILABLE \
+              --wait-interval-seconds 5 \
+              2>&1)
+            RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "FATAL: Subnet creation failed (rc=$RC):"
+              echo "$SUBNET_RESULT" | tail -10
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            SUBNET_ID=$(echo "$SUBNET_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])" 2>/dev/null)
             echo "Subnet created: $SUBNET_ID"
           fi
-          echo "SUBNET_ID=$SUBNET_ID"
 
-          # Output for next step
+          if [ -z "$SUBNET_ID" ]; then
+            echo "FATAL: No subnet ID available"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "=== Setup OK ==="
           echo "ad=$AD" >> $GITHUB_OUTPUT
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
@@ -174,7 +205,6 @@ jobs:
         run: |
           MAX_ROUNDS=33
           WAIT=600
-          RATE_EXTRA=600
           NAME="${{ matrix.instance.name }}"
           OCPUS="${{ matrix.instance.ocpus }}"
           MEMORY="${{ matrix.instance.memory }}"
@@ -183,16 +213,17 @@ jobs:
           IMAGE_ID="${{ steps.setup.outputs.image_id }}"
           SUBNET_ID="${{ steps.setup.outputs.subnet_id }}"
 
-          # Stagger start per instance (0-180s)
+          echo "=== Retry loop: $NAME @ $REGION ==="
+          echo "  AD=$AD | SUBNET=${SUBNET_ID:0:30}..."
+
           STAGGER=$(( $(echo "$NAME" | grep -o '[0-9]') * 45 ))
-          echo "Stagger delay: ${STAGGER}s for $NAME ($REGION)"
           sleep $STAGGER
 
           for round in $(seq 1 $MAX_ROUNDS); do
             JITTER=$((RANDOM % 120))
             sleep $JITTER
 
-            echo "--- [$NAME@$REGION] Round $round/$MAX_ROUNDS ($(date '+%H:%M:%S')) ---"
+            echo "--- [$NAME] Round $round/$MAX_ROUNDS ($(date '+%H:%M:%S')) ---"
 
             RESULT=$(oci compute instance launch \
               --compartment-id "${{ secrets.COMPARTMENT_ID }}" \
@@ -228,7 +259,6 @@ jobs:
                   --region "$REGION" \
                   --query 'data."public-ip"' --raw-output 2>/dev/null || echo "pending")
               fi
-
               echo "  PUBLIC IP: $PUBLIC_IP"
 
               mkdir -p instances
@@ -243,17 +273,17 @@ jobs:
 
             elif echo "$RESULT" | grep -q "Too many requests"; then
               echo "  Rate limited"
-              sleep $RATE_EXTRA
+              sleep 600
 
             elif echo "$RESULT" | grep -q "Out of host capacity"; then
               echo "  Out of capacity"
 
             elif echo "$RESULT" | grep -q "LimitExceeded"; then
-              echo "  OCPU limit reached!"
+              echo "  OCPU limit - stopping"
               exit 0
 
             elif echo "$RESULT" | grep -q "NotAuthorizedOrNotFound"; then
-              echo "  Region not subscribed — skipping"
+              echo "  Not authorized - stopping"
               exit 0
 
             else
@@ -261,11 +291,10 @@ jobs:
               echo "  Error: $MSG"
             fi
 
-            echo "  Waiting ${WAIT}s..."
+            echo "  Wait ${WAIT}s..."
             sleep $WAIT
           done
-
-          echo "=== [$NAME] $MAX_ROUNDS rounds done ==="
+          echo "=== $MAX_ROUNDS rounds done ==="
 
       - name: Keepalive commit
         if: always()
