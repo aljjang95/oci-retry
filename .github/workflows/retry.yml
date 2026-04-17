@@ -2,12 +2,12 @@ name: OCI ARM Instance Retry
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */5 * * *'
   workflow_dispatch: {}
 
 concurrency:
   group: oci-retry
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   create-instance:
@@ -202,8 +202,8 @@ jobs:
       - name: Retry ${{ matrix.instance.name }}
         if: steps.setup.outputs.skip != 'true'
         run: |
-          MAX_ROUNDS=33
-          WAIT=600
+          MAX_ROUNDS=50
+          WAIT=360
           NAME="${{ matrix.instance.name }}"
           OCPUS="${{ matrix.instance.ocpus }}"
           MEMORY="${{ matrix.instance.memory }}"
@@ -215,11 +215,11 @@ jobs:
           echo "=== Retry loop: $NAME @ $REGION ==="
           echo "  AD=$AD | SUBNET=${SUBNET_ID:0:30}..."
 
-          STAGGER=$(( $(echo "$NAME" | grep -o '[0-9]') * 45 ))
+          STAGGER=$(( $(echo "$NAME" | grep -o '[0-9]') * 30 ))
           sleep $STAGGER
 
           for round in $(seq 1 $MAX_ROUNDS); do
-            JITTER=$((RANDOM % 120))
+            JITTER=$((RANDOM % 60))
             sleep $JITTER
 
             echo "--- [$NAME] Round $round/$MAX_ROUNDS ($(date '+%H:%M:%S')) ---"
