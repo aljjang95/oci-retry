@@ -27,11 +27,11 @@ jobs:
           - name: btc-trade-3
             ocpus: 1
             memory: 6
-            region: ap-osaka-1
+            region: ap-chuncheon-1
           - name: btc-trade-4
             ocpus: 1
             memory: 6
-            region: ap-osaka-1
+            region: ap-chuncheon-1
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
